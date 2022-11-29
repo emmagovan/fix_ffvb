@@ -1,0 +1,405 @@
+---
+title: "SIMM with TEFS and conc dep"
+author: "Emma Govan"
+date: "7/14/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(invgamma)
+library(bayesAB)
+library(R2jags)
+library(progress)
+library(gtools)
+library(Boom)
+consumer <- read.csv("geese_consumer.csv", header = TRUE, stringsAsFactors = FALSE)
+sources <- read.csv("geese_sources.csv", header = TRUE, stringsAsFactors = FALSE)[1:4, 1:8]
+disc <- read.csv("geese_discrimination.csv", header = TRUE, stringsAsFactors = FALSE)
+mycol <- rgb(0, 0, 255, max = 255, alpha = 125, names = "blue50")
+mycol2 <- rgb(255, 0, 0, max = 255, alpha = 125)
+mycol3 <- rgb(0, 255, 0, max = 255, alpha = 125)
+```
+Using simplified SIMM
+
+$$y_{i} \sim N(\sum_{k=1}^Kp_k\mu_{k},\sum_{k=1}^Kp_k^2\sigma_{k}^2 + \tau^{-1})$$
+
+$[p_1,...p_k] \sim Dirichlet(\alpha_1,... \alpha_k)$
+
+$\tau \sim Ga(c, d)$
+
+$$\pi(p) = \frac{1}{\beta(\alpha)}\prod_{k=1}^Kp_k^{\alpha_k-1}$$
+
+$$\pi(\tau) = \frac{d^c}{\Gamma(c)} \tau_j^{c-1} \exp(-d\tau_j)$$
+
+$$\pi(y_{i} | p, \tau) = \frac{1}{\sqrt{(2\pi)}} (\sum_{k=1}^Kp_k^2\sigma_{k}^2 + \tau^{-1})^{\frac{n}{2}} \exp\left(-\frac{(\sum_{k=1}^Kp_k^2\sigma_{k}^2 + \tau^{-1})}{2} \sum_{i=1}^n\left(y_{i} - \sum_{k=1}^Kp_k\mu_{k}\right)^2\right)$$
+
+
+
+
+
+
+$$h(\theta) = \log(\pi(p)\pi(\tau)\pi(y|p, \tau))$$
+
+$\log{q_\lambda}(\theta) = \log(q(p)q(\tau))$
+
+
+$$h(\theta) = -\log(\beta(\alpha_0)) + \sum_{k=1}^K\left((\alpha_0-1)(\log(p_k))\right) + c_0\log(d_0) - \log(\Gamma(c_0)) +
+(c_0-1)\log(\tau) - d_0\tau$$
+$$-\frac{1}{2}\log(2\pi) +\frac{n}{2}\log(\tau) - \frac{\tau}{2}\left(\sum_{i=1}^n\left(y_{i} - \sum_{k=1}^K(p_k\mu_{k})\right)^2\right)$$
+
+
+
+$$\log(q_\lambda(\theta)) = -\log(\beta(\alpha)) + \sum_{k=1}^K\left((\alpha-1)(\log(p_k))\right)$$ 
+$$+ c\log(d) - log(\Gamma(c)) + (c-1)log(\tau_j) - d\tau_j$$
+
+Derivatives
+wrt c
+$$\log(d) - \frac{\Gamma'(c)}{\Gamma(c)} + log(\tau_j)$$
+wrt d
+$$\frac{c}{d} - \tau_j$$
+
+wrt each alpha
+$$\log(p_1) - \frac{1}{\beta(\alpha)}*\beta(\alpha)\left(\Psi(\alpha_1)-\Psi(\sum_{k=1}^K(\alpha_k)\right)$$
+Which equals
+$$\log(p_1) - \left(\Psi(\alpha_1)-\Psi(\sum_{k=1}^K(\alpha_k)\right)$$
+For alpha 1
+
+
+
+
+
+
+
+```{r}
+# Just extracting a small sample of consumer values
+y <- consumer[,2]
+n_sources <- 4
+
+n <- length(y)
+
+# This is the number of hyper parameters
+n_param <- 2 + n_sources
+
+
+
+# number of iterations
+n_iter <- 15000
+
+# number of samples
+sam <- 100
+
+pb <- progress_bar$new(total = n_iter)
+
+# Setting up storage for parameters:
+# These are a matrix so we can do multiple samples for each
+p <- array(rep(NA, n_iter * sam * n_sources), dim = c(n_iter, sam, n_sources))
+tau <- matrix(rep(NA, n_iter * sam), nrow = n_iter, ncol = sam)
+sigmasq <- matrix(rep(NA, n_iter * sam), nrow = n_iter, ncol = sam)
+
+
+# Storage for hyperparameters
+alpha <- matrix(rep(NA, n_iter * n_sources), nrow = n_iter, ncol = n_sources)
+c <- c(rep(NA, n_iter))
+d <- c(rep(NA, n_iter))
+
+# Also need starting values
+# Starting values
+c[1] <- 5
+d[1] <- 5
+tau[1, ] <- rgamma(sam, shape = c[1], rate = d[1])
+alpha[1, ] <- c(1,1,1,1)
+
+
+
+p[1,, ] <- rdirichlet(sam, alpha[1, ])
+
+
+
+# Storage for items in loop
+
+h_theta <- matrix(rep(NA, n_iter * sam), nrow = n_iter, ncol = sam)
+log_q_lambda_theta <- matrix(rep(NA, n_iter * sam), nrow = n_iter, ncol = sam)
+delta_lqlt <- array(rep(NA, n_iter * n_param * sam), dim = c(n_iter, sam, n_param))
+sum1 <- c(rep(NA, n_iter))
+sum2 <- c(rep(NA, n_iter))
+sum3 <- c(rep(NA, n_iter))
+sum4 <- c(rep(NA, n_iter))
+sum5 <- c(rep(NA, n_iter))
+sum6 <- c(rep(NA, n_iter))
+
+ga1 <- c(rep(NA, n_iter))
+va1 <- c(rep(NA, n_iter))
+ga2 <- c(rep(NA, n_iter))
+va2 <- c(rep(NA, n_iter))
+ga3 <- c(rep(NA, n_iter))
+va3 <- c(rep(NA, n_iter))
+ga4 <- c(rep(NA, n_iter))
+va4 <- c(rep(NA, n_iter))
+gc <- c(rep(NA, n_iter))
+vc <- c(rep(NA, n_iter))
+gd <- c(rep(NA, n_iter))
+vd <- c(rep(NA, n_iter))
+
+
+
+
+LB <- array(rep(NA, n_iter * n_param * sam), dim = c(n_iter, sam, n_param))
+
+
+# Starting values
+ga1[1] <- 7.209768
+va1[1] <- (ga1[1])^2
+ga2[1] <- -910.9572
+va2[1] <- (ga2[1])^2
+ga3[1] <- 117.538
+va3[1] <- (ga3[1])^2
+ga4[1] <- 426.8924
+va4[1] <- (ga4[1])^2
+
+
+gc[1] <- -145.0821
+vc[1] <- (gc[1])^2
+gd[1] <- 15.02543
+vd[1] <- (gd[1])^2
+
+
+
+convar <- c(rep(NA, n_iter))
+convar[1] <- -1931.886
+
+
+
+n_isotopes <- 1
+mu_kj <- c(sources$Meand15N)
+sigma_kj <- c(sources$SDd15N)
+
+mu_c <- c(disc$Meand15N) #TEFs
+sigma_c <-c(disc$SDd15N)
+
+q <- c(sources$Concd15N) #conc dependence
+
+
+
+
+
+for (i in 2:n_iter) {
+  pb$tick()
+
+  p[i, , ] <- rdirichlet(sam, alpha[i - 1, ])
+  tau[i, ] <- rgamma(sam, shape = c[i - 1], rate = d[i - 1]) 
+  
+  
+
+  for (j in 1:sam) {
+
+    # For each randomly sampled p and overall sigma and sigma_j
+    
+   #h_theta[i] <- -0.5 * n * log(2 * pi) + ((0.5*n) * log(tau[i,j])) - ((tau[i,j] * 0.5) * sum((y - (sum(p[i,j, ] * mu_kj)))^2))  + alpha[1,1]*log(p[i,j,1]) - log(p[i,j,1]) + alpha[1,2]*log(p[i,j,2]) - log(p[i,j,2])  - log(beta(a = alpha[1,1], b= alpha[1,2])) + c[1] * log(d[1]) - log(gamma(c[1])) + (c[1] - 1) * log(tau[i,j]) - d[1] * tau[i, j]
+h_theta[i,j] <- sum(dnorm(y, (sum(p[i,j,]* q * (mu_kj +mu_c)))/sum(p[i,j,]* q), sqrt((sum(p[i,j,]^2*q^2 *(sigma_kj^2+sigma_c^2)))/(sum(p[i,j,]*q))^2 + 1/tau[i,j]), log=TRUE)) + (ddirichlet(p[i,j,], (alpha[1,]), log = TRUE)) +(dgamma(tau[i,j], shape = c[1], rate = d[1], log = TRUE))
+
+    log_q_lambda_theta[i,j] <- (ddirichlet(p[i,j,], (alpha[i-1,]), log = TRUE)) +(dgamma(tau[i,j], shape = c[i-1], rate = d[i-1], log = TRUE))
+   #log_q_lambda_theta[i] <-  alpha[i-1,1]*log(p[i,j,1]) - log(p[i,j,1]) + alpha[i-1,2]*log(p[i,j,2]) - log(p[i,j,2]) + c[i-1] * log(d[i-1]) - log(gamma(c[i-1])) + (c[i-1] - 1) * log(tau[i,j]) - d[i-1] * tau[i, j] - log(beta(a = alpha[i-1,1], b= alpha[i-1,2])) 
+
+
+    delta_lqlt[i,j, ] <- c(
+    log(p[i,j,1]) -(digamma(alpha[i-1,1]) - digamma(sum(alpha[i-1,]))),
+    
+    log(p[i,j,2]) -(digamma(alpha[i-1,2]) - digamma(sum(alpha[i-1,]))),
+    
+    log(p[i,j,3]) -(digamma(alpha[i-1,3]) - digamma(sum(alpha[i-1,]))),
+    
+    log(p[i,j,4]) -(digamma(alpha[i-1,4]) - digamma(sum(alpha[i-1,]))),
+    
+      log(d[i - 1]) - digamma(c[i - 1]) + log(tau[i, j]),
+    
+      (c[i - 1] / d[i - 1]) - (tau[i, j])
+    )
+
+
+
+
+    LB[i, j , ] <- (delta_lqlt[i,j, ]) * ((h_theta[i,j] - log_q_lambda_theta[i,j]) - convar[i - 1])
+    convar[i] <- (cov((delta_lqlt[i,j, ] * (h_theta[i,j] - log_q_lambda_theta[i,j])), delta_lqlt[i,j, ])) / (var(delta_lqlt[i,j, ]))
+  }
+  # For each iteration we take 100 samples - here we get the average of those samples for each parameter
+
+  sum1[i] <- (1 / sam) * sum(LB[i,, 1]) # for alpha1
+  sum2[i] <- (1 / sam) * sum(LB[i,, 2])
+  sum3[i] <- (1 / sam) * sum(LB[i,, 3]) #c
+  sum4[i] <- (1 / sam) * sum(LB[i,, 4]) #d
+  sum5[i] <- (1 / sam) * sum(LB[i,, 5]) #d
+  sum6[i] <- (1 / sam) * sum(LB[i,, 6]) #d
+
+
+
+  ga1[i] <- 0.001 * ga1[i - 1] + (1 - 0.001) * sum1[i]
+  va1[i] <- 0.001 * va1[i - 1] + (1 - 0.001) * (sum1[i])^2
+  ga2[i] <- 0.001 * ga2[i - 1] + (1 - 0.001) * sum2[i]
+  va2[i] <- 0.001 * va2[i - 1] + (1 - 0.001) * (sum2[i])^2
+  ga3[i] <- 0.001 * ga3[i - 1] + (1 - 0.001) * sum3[i]
+  va3[i] <- 0.001 * va3[i - 1] + (1 - 0.001) * (sum3[i])^2 
+  ga4[i] <- 0.001 * ga4[i - 1] + (1 - 0.001) * sum4[i]
+  va4[i] <- 0.001 * va4[i - 1] + (1 - 0.001) * (sum4[i])^2
+
+  gc[i] <- 0.001 * gc[i - 1] + (1 - 0.001) * sum5[i]
+
+  vc[i] <- 0.001 * vc[i - 1] + (1 - 0.001) * (sum5[i]^2)
+
+  gd[i] <- 0.001 * gd[i - 1] + (1 - 0.001) * (sum6[i])
+
+  vd[i] <- 0.001 * vd[i - 1] + (1 - 0.001) * (sum6[i]^2)
+
+
+
+
+
+  # update hyperparameters
+  alpha[i, 1] <- alpha[i - 1, 1] + 0.01 * (ga1[i] / (sqrt(va1[i])))
+  alpha[i, 2] <- alpha[i - 1, 2] + 0.01 * (ga2[i] / (sqrt(va2[i])))
+  alpha[i, 3] <- alpha[i - 1, 3] + 0.01 * (ga3[i] / (sqrt(va3[i])))
+  alpha[i, 4] <- alpha[i - 1, 4] + 0.01 * (ga4[i] / (sqrt(va4[i])))
+  c[i] <- c[i - 1] + 0.01 * (gc[i] / sqrt(vc[i]))
+  d[i] <- d[i - 1] + 0.01 * (gd[i] / sqrt(vd[i]))
+  
+
+}
+
+
+plot(alpha[, 1])
+plot(alpha[, 2])
+plot(alpha[, 3])
+plot(alpha[, 4])
+
+plot(c)
+plot(d)
+
+
+allprob <- ((rdirichlet(6400, (alpha[n_iter, ]))))
+hist(allprob[, 1])
+hist(allprob[, 2])
+hist(allprob[, 3])
+hist(allprob[, 4])
+
+
+```
+
+
+
+
+
+
+
+```{r}
+model_code ='
+model {
+  for (i in 1:N) {
+      y[i] ~ dnorm(inprod(p*q, s_mean+c_mean) /
+        inprod(p,q), var_y^-1)
+        mu[i] <- inprod(p*q, s_mean+c_mean) /
+        inprod(p,q)
+} 
+  p ~ ddirch(alpha)
+
+    var_y <- inprod(pow(p*q,2),s_sd^2+c_sd^2)/pow(inprod(p,q),2)
+      + 1/tau
+
+ tau ~ dgamma(5,5)
+}
+'
+
+
+# Set up the data - these match the data objects in the jags code
+model_data = list(N=length(consumer$Group),
+                  K=4,
+                  J=1,
+                  y=consumer[,2],
+                  s_mean=sources$Meand15N,
+                  s_sd=sources$SDd15N,
+                  alpha=c(1,1,1,1),
+                  q = q,
+                  c_mean = mu_c,
+                  c_sd = sigma_c)
+
+# Choose which parameters to save
+model_parameters = c('p', 'mu', 'tau', 'var_y')
+
+
+
+# Run the model
+model_run = jags(data = model_data,
+                 parameters.to.save = model_parameters,
+                 model.file=textConnection(model_code), 
+                 n.chains=4, # Number of different starting positions
+                 n.iter=10000, # Number of iterations
+                 n.burnin=2000, # Number of iterations to remove at start
+                 n.thin=5) # Amount of thinning)
+
+
+
+
+# Look at the output
+print(model_run)
+```
+
+```{r}
+#generating samples of mu and sigma so I can plot them
+
+musample<-c(rep(NA, 6400))
+sigmasample <- c(rep(NA, 6400))
+jagssample <- c(rep(NA, 6400))
+sample<-rgamma(6400, c[n_iter], d[n_iter])
+
+for(i in 1:6400){
+musample[i]<-(sum(allprob[i,]*q*(mu_kj+mu_c)))/(sum(allprob[i,]*q)) 
+sigmasample[i] <- (sum(((allprob[i,]*q)^2) * (sigma_kj^2+sigma_c^2)))/(sum((allprob[i,]*q)))^2
+jagssample[i]<- (sum(((model_run$BUGSoutput$sims.list$p[i,]*q)^2) * (sigma_kj^2+sigma_c^2)))/(sum((model_run$BUGSoutput$sims.list$p[i,]*q)^2)) + 1/sample[i]
+}
+
+
+
+
+hist(model_run$BUGSoutput$sims.list$p[, 1], xlim=c(0,1), col=mycol2, breaks = 10)
+hist(allprob[, 1], add = TRUE, col = mycol, breaks = 20)
+
+hist(model_run$BUGSoutput$sims.list$p[, 2], xlim = c(0,1), col=mycol2)
+hist(allprob[, 2], add = TRUE, col = mycol, breaks = 10)
+
+hist(model_run$BUGSoutput$sims.list$p[, 3], xlim = c(0,1), col=mycol2)
+hist(allprob[, 3], add = TRUE, col = mycol)
+
+hist(model_run$BUGSoutput$sims.list$p[, 4], xlim = c(0,1), col=mycol2)
+hist(allprob[, 4], add = TRUE, col = mycol)
+
+
+
+
+#jpeg("complexsigma.jpeg")
+#hist((jagssample), col = mycol2, breaks = 25)
+
+
+hist(model_run$BUGSoutput$sims.list$var_y, col = mycol3, xlim = c(1.5, 4))
+hist(sigmasample+1/sample, col=mycol, add = TRUE, breaks = 25)
+#dev.off()
+
+#jpeg("complexmuwithTEF.jpeg")
+hist(model_run$BUGSoutput$sims.list$mu[1:6400, 251], col = mycol2, xlim = c(9, 12))
+hist(musample, col = mycol, breaks = 25, add = TRUE)
+#dev.off()
+
+
+
+
+
+#dev.off()
+```
+
+
+
+
+
+
+
+
